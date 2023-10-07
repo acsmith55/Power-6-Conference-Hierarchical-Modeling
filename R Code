@@ -1,0 +1,177 @@
+# Data Prep ----
+
+# Load the relevant libraries and the college basketball dataset
+library(bayesrules)
+library(tidyverse)
+library(rstanarm)
+library(bayesplot)
+library(tidybayes)
+library(broom.mixed)
+library(forcats)
+
+cbb <- read_csv("cbb.csv")
+
+# Look at the data and attach
+head(cbb)
+nrow(cbb)
+
+cbb %>%
+  group_by(Region, Conference) %>%
+  summarise(N = n()) 
+
+# Get rid of groups with less than 10 observations
+school_exclusions <- cbb %>%
+  group_by(Region, Conference) %>%
+  summarise(N = n()) %>%
+  filter(N < 10) # finds the region/conference combos we want to remove
+
+school_exclusions <- school_exclusions %>%
+  mutate(Region_Conf = paste(Region, Conference)) # creates strings to match
+
+cbb_data <- cbb %>%
+  mutate(Region_Conf = paste(Region, Conference))
+
+cbb_data <- cbb_data %>%
+  filter(!Region_Conf %in% school_exclusions$Region_Conf) # match and remove
+
+cbb_data %>%
+  group_by(Region, Conference) %>%
+  summarise(N = n()) # looks good
+  # shows that the data consists of schools within conferences and conferences
+  # within regions. That is, a given school is not in every conference and 
+  # every conference is not in every region
+
+# Attach the data
+attach(cbb_data)
+
+# Look at Wins
+ggplot(data = cbb_data, aes(x = Wins)) + 
+  geom_density() # centered at 20, varies by about 10 wins
+
+# Look at the impacts of Points Scored and Points Allowed ----
+ggplot(data = cbb_data, aes(x = Wins, y = Points_Scored)) +
+  geom_point() # slightly positive relationship
+
+ggplot(data = cbb_data, aes(x = Wins, y = Points_Allowed)) +
+  geom_point() # slightly negative relationship
+
+# View the group distributions for both Region and Conference ----
+# Region
+region_labels <- cbb_data %>% 
+  group_by(Region) %>%  
+  summarise(xPos = mean(Wins),
+            yPos = max((density(Wins))$y)) # creates labels for the density plot
+
+ggplot() + 
+  geom_density(data=cbb_data, aes(x = Wins, group = Region, colour=Region)) +
+  geom_label(data=region_labels, aes(x = xPos, y = yPos, colour=Region, label=Region)) +
+  theme_light() +
+  theme(legend.position = "None") # Creates the density plot
+
+# Conference
+conference_labels <- cbb_data %>% 
+  group_by(Conference) %>%  
+  summarise(xPos = mean(Wins),
+            yPos = max((density(Wins))$y)) # creates labels for the density plot
+
+ggplot() + 
+  geom_density(data=cbb_data, aes(x = Wins, group = Conference, colour=Conference)) +
+  geom_label(data=conference_labels, aes(x = xPos, y = yPos, colour=Conference, label=Conference)) +
+  theme_light() +
+  theme(legend.position = "None") # Creates the density plot
+
+  # Notes: Neither of these suggests that either conference or region has a
+  # particularly large impact on college basketball win totals, but we still
+  # need to simulate
+
+# Simulation ----
+
+# Model with region and conference grouped
+ncaa_model_grouped <- stan_glmer(
+  Wins ~ Points_Avg + Points_Allowed + (1 | Conference) + (1 | Region), 
+  data = cbb_data, family = gaussian,
+  prior_intercept = normal(0, 2.5, autoscale = TRUE),
+  prior = normal(0, 2.5, autoscale = TRUE), 
+  prior_covariance = decov(reg = 1, conc = 1, shape = 1, scale = 1),
+  chains = 4, iter = 5000*2, seed = 84735
+)
+
+# Model without Region
+no_region_model <- stan_glmer(
+  Wins ~ Points_Avg + Points_Allowed + (1 | Conference), 
+  data = cbb_data, family = gaussian,
+  prior_intercept = normal(0, 2.5, autoscale = TRUE),
+  prior = normal(0, 2.5, autoscale = TRUE), 
+  prior_covariance = decov(reg = 1, conc = 1, shape = 1, scale = 1),
+  chains = 4, iter = 5000*2, seed = 84735
+)
+
+# Simulation Diagnostics ----
+# Look at Simulation Diagnostics for the fully-grouped model
+mcmc_trace(ncaa_model_grouped) # both sigmas look strange, everything else fine
+mcmc_dens_overlay(ncaa_model_grouped) # similar to trace
+mcmc_acf(ncaa_model_grouped) # all look fine
+neff_ratio(ncaa_model_grouped)
+rhat(ncaa_model_grouped)
+
+# Look at Simulation Diagnostics for the model without region
+mcmc_trace(no_region_model) # conference sigma looks strange
+mcmc_dens_overlay(no_region_model) # similar to trace
+mcmc_acf(no_region_model) # some look like they might be taking a while
+neff_ratio(no_region_model) # all good
+rhat(no_region_model) # all good
+
+# Comparing Trend Summaries ----
+grouped_model_mean <- tidy(ncaa_model_grouped, effects = "fixed")
+grouped_model_mean 
+  # 35.1 = 0.659 (Points_Avg) - 0.908 (Points_Allowed)
+  # might suggest that good defense is better than good offense
+
+no_region_mean <- tidy(no_region_model, effects = "fixed")
+no_region_mean
+  # 34.6 = 0.661 (Points_Avg) - 0.901 (Points_Allowed)
+
+# Combine the summaries for both models
+joined_means <- grouped_model_mean %>%
+  right_join(., no_region_mean, by ="term",
+             suffix = c("_model_1", "_model_2")) %>%
+  select(-starts_with("std.error"))
+joined_means
+
+write.csv(joined_means, "Comparing Means.csv", row.names = F) # write for table
+
+# Get variance summaries for both models
+grouped_model_var <- tidy(ncaa_model_grouped, effects = "ran_pars")
+grouped_model_var
+no_region_model_var <- tidy(no_region_model, effects = "ran_pars")
+no_region_model_var
+
+# Write to Csv for Report Table
+write.csv(grouped_model_var, "Grouped Model Variance Summary.csv", row.names = F)
+write.csv(no_region_model_var, "No Region Model Variance Summary.csv", row.names = F)
+
+# Examine group-specific parameters ----
+# Global regression parameters
+grouped_model_mean %>% 
+  select(term, estimate)
+
+# Group-level terms
+group_levels <- tidy(ncaa_model_grouped, effects = "ran_vals") %>% 
+  select(level, group, estimate)
+
+# Look at Region effects
+region_tweaks <- group_levels %>% 
+  filter(group == "Region")
+region_tweaks
+
+write.csv(region_tweaks, "Region Tweaks.csv") # write to table
+  # Positive tweak for Midwest, negative tweaks for Northeast, South, and West
+
+# Look at Conference effects
+conference_tweaks <- group_levels %>% 
+  filter(group == "Conference")
+conference_tweaks
+
+write.csv(conference_tweaks, "Conference Tweaks.csv") # write to table 
+  # Positive tweaks for ACC, Big East, and SEC, but negative tweaks for Big 12,
+  # Big Ten, and Pac 12
